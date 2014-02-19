@@ -103,6 +103,12 @@ def parse_args():
       help="When destroying a cluster, delete the security groups that were created")
   parser.add_option("--use-existing-master", action="store_true", default=False,
       help="Launch fresh slaves, but use an existing stopped master if possible")
+  parser.add_option("--subnet-id", default=None,
+      help="VPC Subnet id where to launch instances")
+  parser.add_option("--vpc-id", default=None,
+      help="VPC ID where to launch instances")
+  parser.add_option("--secure-ips", default="0.0.0.0/0",
+      help="IP addresses to add to security group")
 
   (opts, args) = parser.parse_args()
   if len(args) != 2:
@@ -127,14 +133,14 @@ def parse_args():
 
 
 # Get the EC2 security group of the given name, creating it if it doesn't exist
-def get_or_make_group(conn, name):
+def get_or_make_group(conn, name,vpc_id):
   groups = conn.get_all_security_groups()
   group = [g for g in groups if g.name == name]
   if len(group) > 0:
     return group[0]
   else:
     print "Creating security group " + name
-    return conn.create_security_group(name, "Spark EC2 group")
+    return conn.create_security_group(name, "Spark EC2 group",vpc_id)
 
 
 # Wait for a set of launched instances to exit the "pending" state
@@ -225,29 +231,40 @@ def launch_cluster(conn, opts, cluster_name):
     print >> stderr, "ERROR: Must provide a key pair name (-k) to use on instances."
     sys.exit(1)    
   print "Setting up security groups..."
-  master_group = get_or_make_group(conn, cluster_name + "-master")
-  slave_group = get_or_make_group(conn, cluster_name + "-slaves")
+  secure_ips = opts.secure_ips
+  master_group = get_or_make_group(conn, cluster_name + "-master",opts.vpc_id)
+  slave_group = get_or_make_group(conn, cluster_name + "-slaves",opts.vpc_id)
   if master_group.rules == []: # Group was just now created
-    master_group.authorize(src_group=master_group)
-    master_group.authorize(src_group=slave_group)
-    master_group.authorize('tcp', 22, 22, '0.0.0.0/0')
-    master_group.authorize('tcp', 8080, 8081, '0.0.0.0/0')
-    master_group.authorize('tcp', 19999, 19999, '0.0.0.0/0')
-    master_group.authorize('tcp', 50030, 50030, '0.0.0.0/0')
-    master_group.authorize('tcp', 50070, 50070, '0.0.0.0/0')
-    master_group.authorize('tcp', 60070, 60070, '0.0.0.0/0')
-    master_group.authorize('tcp', 4040, 4045, '0.0.0.0/0')
+    if opts.vpc_id == None:
+      master_group.authorize(src_group=master_group)
+      master_group.authorize(src_group=slave_group)
+    else:
+      master_group.authorize(ip_protocol='icmp',from_port=-1,to_port=-1,src_group=slave_group)
+      master_group.authorize(ip_protocol='tcp',from_port=0,to_port=65535,src_group=master_group)
+      master_group.authorize(ip_protocol='tcp',from_port=0,to_port=65535,src_group=slave_group)
+    master_group.authorize('tcp', 22, 22, secure_ips)
+    master_group.authorize('tcp', 8080, 8081, secure_ips)
+    master_group.authorize('tcp', 19999, 19999, secure_ips)
+    master_group.authorize('tcp', 50030, 50030, secure_ips)
+    master_group.authorize('tcp', 50070, 50070, secure_ips)
+    master_group.authorize('tcp', 60070, 60070, secure_ips)
+    master_group.authorize('tcp', 4040, 4045, secure_ips)
     if opts.ganglia:
       master_group.authorize('tcp', 5080, 5080, '0.0.0.0/0')
   if slave_group.rules == []: # Group was just now created
-    slave_group.authorize(src_group=master_group)
-    slave_group.authorize(src_group=slave_group)
-    slave_group.authorize('tcp', 22, 22, '0.0.0.0/0')
-    slave_group.authorize('tcp', 8080, 8081, '0.0.0.0/0')
-    slave_group.authorize('tcp', 50060, 50060, '0.0.0.0/0')
-    slave_group.authorize('tcp', 50075, 50075, '0.0.0.0/0')
-    slave_group.authorize('tcp', 60060, 60060, '0.0.0.0/0')
-    slave_group.authorize('tcp', 60075, 60075, '0.0.0.0/0')
+    if opts.vpc_id == None:
+      slave_group.authorize(src_group=master_group)
+      slave_group.authorize(src_group=slave_group)
+    else:
+      slave_group.authorize(ip_protocol='icmp',from_port=-1,to_port=-1,src_group=master_group)
+      slave_group.authorize(ip_protocol='tcp',from_port=0,to_port=65535,src_group=master_group)
+      slave_group.authorize(ip_protocol='tcp',from_port=0,to_port=65535,src_group=slave_group)
+    slave_group.authorize('tcp', 22, 22, secure_ips)
+    slave_group.authorize('tcp', 8080, 8081, secure_ips)
+    slave_group.authorize('tcp', 50060, 50060, secure_ips)
+    slave_group.authorize('tcp', 50075, 50075, secure_ips)
+    slave_group.authorize('tcp', 60060, 60060, secure_ips)
+    slave_group.authorize('tcp', 60075, 60075, secure_ips)
 
   # Check if instances are already running in our groups
   existing_masters, existing_slaves = get_existing_cluster(conn, opts, cluster_name,
@@ -341,13 +358,20 @@ def launch_cluster(conn, opts, cluster_name):
     for zone in zones:
       num_slaves_this_zone = get_partition(opts.slaves, num_zones, i)
       if num_slaves_this_zone > 0:
-        slave_res = image.run(key_name = opts.key_pair,
-                              security_groups = [slave_group],
+        interface = boto.ec2.networkinterface.NetworkInterfaceSpecification(
+                    subnet_id=opts.subnet_id,
+                    groups=[slave_group.id],
+                    associate_public_ip_address=True)
+        interfaces = boto.ec2.networkinterface.NetworkInterfaceCollection(interface)
+        slave_res = image.connection.run_instances(image.id, key_name = opts.key_pair,
+                              #security_group_ids = [slave_group.id],
                               instance_type = opts.instance_type,
                               placement = zone,
                               min_count = num_slaves_this_zone,
                               max_count = num_slaves_this_zone,
-                              block_device_map = block_map)
+                              block_device_map = block_map,
+                              #subnet_id = opts.subnet_id,
+                              network_interfaces = interfaces)
         slave_nodes += slave_res.instances
         print "Launched %d slaves in %s, regid = %s" % (num_slaves_this_zone,
                                                         zone, slave_res.id)
@@ -366,13 +390,20 @@ def launch_cluster(conn, opts, cluster_name):
       master_type = opts.instance_type
     if opts.zone == 'all':
       opts.zone = random.choice(conn.get_all_zones()).name
-    master_res = image.run(key_name = opts.key_pair,
-                           security_groups = [master_group],
+    interface = boto.ec2.networkinterface.NetworkInterfaceSpecification(
+                subnet_id=opts.subnet_id,
+                groups=[master_group.id],
+                associate_public_ip_address=True)
+    interfaces = boto.ec2.networkinterface.NetworkInterfaceCollection(interface)
+    master_res = image.connection.run_instances(image.id, key_name = opts.key_pair,
+                           #security_group_ids = [master_group.id],
                            instance_type = master_type,
                            placement = opts.zone,
                            min_count = 1,
                            max_count = 1,
-                           block_device_map = block_map)
+                           block_device_map = block_map,
+                           #subnet_id = opts.subnet_id,
+                           network_interfaces = interfaces)
     master_nodes = master_res.instances
     print "Launched master in %s, regid = %s" % (zone, master_res.id)
 
