@@ -34,7 +34,7 @@ import urllib2
 from optparse import OptionParser
 from sys import stderr
 import boto
-from boto.ec2.blockdevicemapping import BlockDeviceMapping, EBSBlockDeviceType
+from boto.ec2.blockdevicemapping import BlockDeviceMapping, EBSBlockDeviceType, BlockDeviceType
 from boto import ec2
 
 class UsageError(Exception):
@@ -293,6 +293,10 @@ def launch_cluster(conn, opts, cluster_name):
 
   # Create block device mapping so that we can add an EBS volume if asked to
   block_map = BlockDeviceMapping()
+  num_disks = get_num_disks(opts.instance_type)
+  for i in range(num_disks):
+    device = BlockDeviceType(ephemeral_name='ephemeral'+str(i))
+    block_map['/dev/xvd'+chr(98+i)] = device
   if opts.ebs_vol_size > 0:
     device = EBSBlockDeviceType()
     device.size = opts.ebs_vol_size
@@ -417,8 +421,7 @@ def launch_cluster(conn, opts, cluster_name):
                            max_count = 1,
                            block_device_map = block_map,
                            #subnet_id = opts.subnet_id,
-                           network_interfaces = interfaces,
-                           placement_group = placement_group)
+                           network_interfaces = interfaces)
     master_nodes = master_res.instances
     print "Launched master in %s, regid = %s" % (zone, master_res.id)
 
